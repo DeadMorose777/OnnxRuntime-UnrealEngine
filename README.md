@@ -8,6 +8,9 @@ Realtime neural style transfer sample updated to Unreal Engine 5.5 and the Neura
 - Custom RDG pipeline (`StyleTransferShaders.usf`) to encode the scene into model input tensors and decode the inference output back to an HDR buffer.
 - Sample Blueprint (`Content/FirstPerson/Blueprints/StyleTransferConfig`) that exposes style switching and hotkeys.
 - Utility script to tidy exported ONNX models before import (`Scripts/clean_onnx_initializers.py`).
+
+<img width="3045" height="1763" alt="image" src="https://github.com/user-attachments/assets/eff5e325-6309-460e-b498-f825be17ff76" />
+->
 <img width="3045" height="1948" alt="image" src="https://github.com/user-attachments/assets/153aeab0-7c27-4cb9-912d-1dae0e847578" />
 
 ## Requirements
