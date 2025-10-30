@@ -1,0 +1,129 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+#ifndef STYLE_TRANSFER_THREADGROUP_SIZE
+#define STYLE_TRANSFER_THREADGROUP_SIZE 8
+#endif
+
+#if STYLE_TRANSFER_VARIANT_ENCODE
+Texture2D<float4> SourceTexture;
+SamplerState SourceSampler;
+RWBuffer<float> OutputTensor;
+
+int2 ModelResolution;
+float2 ViewMin;
+float2 ViewSize;
+float2 SourceExtent;
+float EncodeScale;
+float EncodeBias;
+uint ChannelCount;
+#endif
+
+#if STYLE_TRANSFER_VARIANT_DECODE
+Buffer<float> InputTensor;
+RWTexture2D<float4> StylizedOutput;
+
+int2 ModelResolution;
+float DecodeScale;
+float DecodeBias;
+uint ChannelCount;
+#endif
+
+#if STYLE_TRANSFER_VARIANT_UPSCALE
+Texture2D<float4> SourceTexture;
+SamplerState SourceSampler;
+RWTexture2D<float4> TargetTexture;
+
+int2 SourceResolution;
+int2 TargetResolution;
+int2 TargetOffset;
+#endif
+
+uint GetPlaneSize()
+{
+	return ModelResolution.x * ModelResolution.y;
+}
+
+uint GetPixelIndex(uint2 PixelCoord)
+{
+	return PixelCoord.y * ModelResolution.x + PixelCoord.x;
+}
+
+#if STYLE_TRANSFER_VARIANT_ENCODE
+[numthreads(STYLE_TRANSFER_THREADGROUP_SIZE, STYLE_TRANSFER_THREADGROUP_SIZE, 1)]
+void StyleTransferEncodeCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x >= ModelResolution.x || DispatchThreadId.y >= ModelResolution.y)
+	{
+		return;
+	}
+
+	const float2 Pixel = float2(DispatchThreadId.xy) + 0.5f;
+	const float2 ScreenPixel = ViewMin + Pixel * (ViewSize / float2(ModelResolution));
+	const float2 UV = ScreenPixel / SourceExtent;
+
+	float3 Color = SourceTexture.SampleLevel(SourceSampler, UV, 0.0f).rgb;
+	Color = saturate(Color);
+
+	const uint PlaneSize = GetPlaneSize();
+	const uint PixelIndex = GetPixelIndex(DispatchThreadId.xy);
+
+	if (ChannelCount >= 1)
+	{
+		OutputTensor[PixelIndex] = Color.b * EncodeScale + EncodeBias;
+	}
+
+	if (ChannelCount >= 2)
+	{
+		OutputTensor[PixelIndex + PlaneSize] = Color.g * EncodeScale + EncodeBias;
+	}
+
+	if (ChannelCount >= 3)
+	{
+		OutputTensor[PixelIndex + 2 * PlaneSize] = Color.r * EncodeScale + EncodeBias;
+	}
+}
+#endif
+
+#if STYLE_TRANSFER_VARIANT_DECODE
+[numthreads(STYLE_TRANSFER_THREADGROUP_SIZE, STYLE_TRANSFER_THREADGROUP_SIZE, 1)]
+void StyleTransferDecodeCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x >= ModelResolution.x || DispatchThreadId.y >= ModelResolution.y)
+	{
+		return;
+	}
+
+	const uint PlaneSize = GetPlaneSize();
+	const uint PixelIndex = GetPixelIndex(DispatchThreadId.xy);
+
+	float3 Result = float3(0.0f, 0.0f, 0.0f);
+	Result.b = (ChannelCount >= 1) ? InputTensor[PixelIndex] * DecodeScale + DecodeBias : 0.0f;
+	Result.g = (ChannelCount >= 2) ? InputTensor[PixelIndex + PlaneSize] * DecodeScale + DecodeBias : Result.b;
+	Result.r = (ChannelCount >= 3) ? InputTensor[PixelIndex + 2 * PlaneSize] * DecodeScale + DecodeBias : Result.g;
+
+	Result = saturate(Result);
+
+	StylizedOutput[DispatchThreadId.xy] = float4(Result, 1.0f);
+}
+#endif
+
+#if STYLE_TRANSFER_VARIANT_UPSCALE
+[numthreads(STYLE_TRANSFER_THREADGROUP_SIZE, STYLE_TRANSFER_THREADGROUP_SIZE, 1)]
+void StyleTransferUpscaleCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x >= TargetResolution.x || DispatchThreadId.y >= TargetResolution.y)
+	{
+		return;
+	}
+
+	const float2 Pixel = float2(DispatchThreadId.xy) + 0.5f;
+	const float2 LowResUV = Pixel / float2(TargetResolution);
+	const float4 Sampled = SourceTexture.SampleLevel(SourceSampler, LowResUV, 0.0f);
+
+	const uint2 OutputCoord = TargetOffset + DispatchThreadId.xy;
+	TargetTexture[OutputCoord] = Sampled;
+}
+#endif

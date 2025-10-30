@@ -9,8 +9,7 @@ UStyleTransferBlueprintLibrary::UStyleTransferBlueprintLibrary(const FObjectInit
 	: Super(ObjectInitializer)
 {
 }
-void UStyleTransferBlueprintLibrary::SetStyle(UNeuralNetwork* Model)
+void UStyleTransferBlueprintLibrary::SetStyle(UNNEModelData* ModelData, FName RuntimeName)
 {
-	Model->AddToRoot();
-	FRealtimeStyleTransferViewExtension::SetStyle(Model);
+	FRealtimeStyleTransferViewExtension::SetStyle(ModelData, RuntimeName);
 }

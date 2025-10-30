@@ -4,9 +4,8 @@
 
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
+#include "NNEModelData.h"
 #include "StyleTransferBlueprintLibrary.generated.h"
-
-class UNeuralNetwork;
 
 UCLASS()
 class FPSTYLETRANSFER_API UStyleTransferBlueprintLibrary : public UBlueprintFunctionLibrary
@@ -14,5 +13,5 @@ class FPSTYLETRANSFER_API UStyleTransferBlueprintLibrary : public UBlueprintFunc
 	GENERATED_UCLASS_BODY()
 	
 	UFUNCTION(Exec, BlueprintCallable, Category = "Style Transfer")
-	static void SetStyle(UNeuralNetwork* Model);
+	static void SetStyle(UNNEModelData* ModelData, FName RuntimeName = NAME_None);
 };

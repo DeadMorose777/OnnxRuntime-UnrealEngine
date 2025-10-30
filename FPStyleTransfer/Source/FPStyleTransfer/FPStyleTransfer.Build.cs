@@ -25,13 +25,19 @@ public class FPStyleTransfer : ModuleRules
 
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-		//added to supress warnings from opencv plugin
-		bEnableUndefinedIdentifierWarnings = false;
-		DefaultBuildSettings = BuildSettingsVersion.V2;
+		UndefinedIdentifierWarningLevel = WarningLevel.Off;
+		DefaultBuildSettings = BuildSettingsVersion.V5;
 
-		PublicDependencyModuleNames.AddRange(new string[] { 
-			"Core", 
-			"CoreUObject", "Engine", "OpenCV", "OpenCVHelper", "InputCore", "HeadMountedDisplay" });
+		PublicDependencyModuleNames.AddRange(new string[] {
+			"Core",
+			"CoreUObject",
+			"Engine",
+			"InputCore",
+			"HeadMountedDisplay",
+			"NNE",
+			"NNERuntimeORT",
+			"NNERuntimeRDG"
+		});
 
 		PrivateDependencyModuleNames.AddRange(
 							new string[]
@@ -44,8 +50,9 @@ public class FPStyleTransfer : ModuleRules
 										"RHI",
 										"RHICore",
 										"D3D12RHI",
-										"OpenCV",
-										"OpenCVHelper" 
+										"NNE",
+										"NNERuntimeORT",
+										"NNERuntimeRDG"
 								// ... add private dependencies that you statically link with here ...  
 							}
 						);

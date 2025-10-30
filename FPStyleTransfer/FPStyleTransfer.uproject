@@ -1,16 +1,15 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "5.0",
+	"EngineAssociation": "5.5",
 	"Category": "",
 	"Description": "",
 	"Modules": [
 		{
 			"Name": "FPStyleTransfer",
 			"Type": "Runtime",
-			"LoadingPhase": "PostEngineInit",
+			"LoadingPhase": "PostConfigInit",
 			"AdditionalDependencies": [
 				"OpenCVHelper",
-				"NeuralNetworkInference",
 				"Engine"
 			]
 		}
@@ -33,11 +32,15 @@
 			]
 		},
 		{
-			"Name": "NeuralNetworkInference",
+			"Name": "NNERuntimeORT",
 			"Enabled": true
 		},
 		{
 			"Name": "OpenCV",
+			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeRDG",
 			"Enabled": true
 		}
 	]

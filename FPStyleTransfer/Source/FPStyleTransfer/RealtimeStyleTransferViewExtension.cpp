@@ -5,20 +5,13 @@
 #include "Modules/ModuleManager.h"
 #include "PostProcess/PostProcessMaterial.h"
 #include "PostProcess/SceneRenderTargets.h"
-
-#include "MyNeuralNetwork.h"
-#include "PreOpenCVHeaders.h"
-#include "OpenCVHelper.h"
-#include <ThirdParty/OpenCV/include/opencv2/imgproc.hpp>
-#include <ThirdParty/OpenCV/include/opencv2/highgui/highgui.hpp>
-#include <ThirdParty/OpenCV/include/opencv2/core.hpp>
-#include "PostOpenCVHeaders.h"
-#include <vector>
-
-#include "Math/PackedVector.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "StyleTransferShaders.h"
+#include "HAL/IConsoleManager.h"
+#include "NNERuntimeRDG.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogRealtimeStyleTransfer, Log, All);
-void RenderMyTest(FRHICommandList &RHICmdList, ERHIFeatureLevel::Type FeatureLevel, const FLinearColor &Color);
 
 namespace RealtimeStyleTransfer
 {
@@ -27,236 +20,373 @@ namespace RealtimeStyleTransfer
 		TEXT("r.RealtimeStyleTransfer.Enable"),
 		IsActive,
 		TEXT("Allows an additional rendering pass that will apply a neural style to the frame.\n")
-			TEXT("=0:off (default), >0: on"),
+		TEXT("=0:off (default), >0: on"),
 		ECVF_Cheat | ECVF_RenderThreadSafe);
+}
 
+TStrongObjectPtr<UMyNeuralNetwork> FRealtimeStyleTransferViewExtension::ModelOwner;
+FStyleTransferProxyPtr FRealtimeStyleTransferViewExtension::ModelProxy;
 
-} 
-//------------------------------------------------------------------------------
-FRealtimeStyleTransferViewExtension::FRealtimeStyleTransferViewExtension(const FAutoRegister &AutoRegister)
+FRealtimeStyleTransferViewExtension::FRealtimeStyleTransferViewExtension(const FAutoRegister& AutoRegister)
 	: FSceneViewExtensionBase(AutoRegister)
 {
-	ViewExtensionIsActive = GDynamicRHI->GetName() == FString(TEXT("D3D12"));
+	const FString RHIName = GDynamicRHI ? GDynamicRHI->GetName() : FString(TEXT("Unknown"));
+	ViewExtensionIsActive = (RHIName == TEXT("D3D12") || RHIName == TEXT("D3D11"));
+
+	UE_LOG(LogRealtimeStyleTransfer, Log, TEXT("RealtimeStyleTransferViewExtension created. RHI='%s', Active=%s"),
+		*RHIName,
+		ViewExtensionIsActive ? TEXT("true") : TEXT("false"));
 }
 
-//------------------------------------------------------------------------------
-UMyNeuralNetwork* FRealtimeStyleTransferViewExtension::myNetwork = nullptr;
-
-//------------------------------------------------------------------------------
-void FRealtimeStyleTransferViewExtension::SetStyle(UNeuralNetwork* Model)
+void FRealtimeStyleTransferViewExtension::SetStyle(UNNEModelData* ModelData, FName RuntimeName)
 {
-	myNetwork = NewObject<UMyNeuralNetwork>();
-	Model->SetDeviceType(ENeuralDeviceType::GPU);
-	myNetwork->Network = Model;
+	if (!ModelData)
+	{
+		UE_LOG(LogRealtimeStyleTransfer, Log, TEXT("Style transfer disabled (no model)."));
+		ModelOwner.Reset();
+		ModelProxy.Reset();
+
+		RealtimeStyleTransfer::IsActive = 0;
+
+		if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RealtimeStyleTransfer.Enable")))
+		{
+			CVar->Set(0, ECVF_SetByCode);
+		}
+		return;
+	}
+
+	UMyNeuralNetwork* Instance = NewObject<UMyNeuralNetwork>();
+	if (!Instance->Initialize(ModelData, RuntimeName))
+	{
+		UE_LOG(LogRealtimeStyleTransfer, Error, TEXT("Failed to initialize NNE model '%s'"), *ModelData->GetName());
+		ModelOwner.Reset();
+		ModelProxy.Reset();
+		return;
+	}
+
+	ModelOwner.Reset(Instance);
+	ModelProxy = Instance->GetProxy();
+
+	if (!ModelProxy.IsValid())
+	{
+		UE_LOG(LogRealtimeStyleTransfer, Error, TEXT("Model proxy returned invalid after initialization of '%s'."), *ModelData->GetName());
+		return;
+	}
+
+	UE_LOG(LogRealtimeStyleTransfer, Log, TEXT("Style transfer enabled with model '%s' (runtime: %s). InputTensor %ux%ux%u%u, OutputTensor %ux%ux%u%u"),
+		*ModelData->GetName(),
+		RuntimeName.IsNone() ? TEXT("default") : *RuntimeName.ToString(),
+		ModelProxy->InputTensorShape.GetData()[0],
+		ModelProxy->InputTensorShape.GetData()[1],
+		ModelProxy->InputTensorShape.GetData()[2],
+		ModelProxy->InputTensorShape.GetData()[3],
+		ModelProxy->OutputTensorShape.GetData()[0],
+		ModelProxy->OutputTensorShape.GetData()[1],
+		ModelProxy->OutputTensorShape.GetData()[2],
+		ModelProxy->OutputTensorShape.GetData()[3]);
+
+	RealtimeStyleTransfer::IsActive = 1;
+
+	if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RealtimeStyleTransfer.Enable")))
+	{
+		CVar->Set(1, ECVF_SetByCode);
+	}
 }
 
-//------------------------------------------------------------------------------
-bool FRealtimeStyleTransferViewExtension::IsActiveThisFrame_Internal(const FSceneViewExtensionContext &Context) const
+bool FRealtimeStyleTransferViewExtension::IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const
 {
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("IsActiveThisFrame_Internal -> %s"), ViewExtensionIsActive ? TEXT("true") : TEXT("false"));
 	return ViewExtensionIsActive;
 }
 
-//------------------------------------------------------------------------------
-BEGIN_SHADER_PARAMETER_STRUCT(FStylePassParameters, )
-RDG_TEXTURE_ACCESS(Source, ERHIAccess::CPURead)
-END_SHADER_PARAMETER_STRUCT()
-
-void FRealtimeStyleTransferViewExtension::AddStylePass_RenderThread(
-	FRDGBuilder &GraphBuilder,
-	FRDGTextureRef SourceTexture)
+void FRealtimeStyleTransferViewExtension::BeginRenderViewFamily(FSceneViewFamily& InViewFamily)
 {
-	if (SourceTexture == nullptr)
-	{
-		UE_LOG(LogRealtimeStyleTransfer, Warning, TEXT("Skipping null texture"));
-		return;
-	}
-
-	FStylePassParameters *Parameters = GraphBuilder.AllocParameters<FStylePassParameters>();
-	Parameters->Source = SourceTexture;
-
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("RealtimeStyleTransfer"),
-		Parameters,
-		ERDGPassFlags::Readback,
-		[this, SourceTexture](FRHICommandListImmediate& RHICmdList) {
-				if (myNetwork == nullptr)
-				{
-					return;
-				}
-			
-				FRHITexture2D* Texture = SourceTexture->GetRHI()->GetTexture2D();
-				Width = Texture->GetSizeX();
-				Height = Texture->GetSizeY();
-				CopyTextureFromGPUToCPU(RHICmdList, Texture);
-				ResizeScreenImageToMatchModel();
-				ApplyStyle();
-				ResizeModelImageToMatchScreen();
-				CopyTextureFromCPUToGPU(RHICmdList, Texture);
-		});
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("BeginRenderViewFamily: %p"), static_cast<const void*>(&InViewFamily));
 }
 
-
-//------------------------------------------------------------------------------
-void FRealtimeStyleTransferViewExtension::CopyTextureFromCPUToGPU(FRHICommandListImmediate& RHICmdList, FRHITexture2D* Texture)
+void FRealtimeStyleTransferViewExtension::PreRenderViewFamily_RenderThread(FRHICommandListImmediate& RHICmdList, FSceneViewFamily& InViewFamily)
 {
-	const FUpdateTextureRegion2D TextureRegion2D(0,0,0,0,Width,Height);
-	RHICmdList.UpdateTexture2D(Texture, 0, TextureRegion2D, Width * 4, (const uint8 *)StylizedImageCPU.GetData());
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("PreRenderViewFamily_RenderThread: %p"), static_cast<const void*>(&InViewFamily));
 }
 
-//------------------------------------------------------------------------------
-void FRealtimeStyleTransferViewExtension::CopyTextureFromGPUToCPU(FRHICommandListImmediate& RHICmdList, FRHITexture2D* Texture)
+void FRealtimeStyleTransferViewExtension::PreRenderView_RenderThread(FRHICommandListImmediate& RHICmdList, FSceneView& InView)
 {
-	const int PixelCount = Width * Height;
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("PreRenderView_RenderThread: View=%p"), static_cast<const void*>(&InView));
+}
 
-	struct FReadSurfaceContext
+namespace
+{
+	FIntVector MakeGroupCount(FIntPoint Resolution)
 	{
-		FRHITexture *BackBuffer;
-		TArray<FColor> &OutData;
-		FIntRect Rect;
-		FReadSurfaceDataFlags Flags;
-	};
-
-	const FReadSurfaceContext readSurfaceContext = {
-		Texture,
-		RawImage,
-		FIntRect(0, 0, Width, Height),
-		FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX)
-	};
-
-	RHICmdList.ReadSurfaceData(
-		readSurfaceContext.BackBuffer,
-		readSurfaceContext.Rect,
-		readSurfaceContext.OutData,
-		readSurfaceContext.Flags);
-
-	InputImageCPU.Reset();
-	InputImageCPU.Reserve(PixelCount*3);
-
-	for (int i = 0; i < RawImage.Num(); i++)
-	{
-		const FColor &Pixel = RawImage[i];
-		InputImageCPU.Add(Pixel.R);
-		InputImageCPU.Add(Pixel.G);
-		InputImageCPU.Add(Pixel.B);
+		const int32 GroupSize = FPStyleTransferShaders::kThreadGroupSize;
+		return FIntVector(
+			FMath::DivideAndRoundUp(Resolution.X, GroupSize),
+			FMath::DivideAndRoundUp(Resolution.Y, GroupSize),
+			1);
 	}
 }
 
-//------------------------------------------------------------------------------
-void FRealtimeStyleTransferViewExtension::ResizeScreenImageToMatchModel()
+FRDGTextureRef FRealtimeStyleTransferViewExtension::ExecuteStyleTransfer(
+	FRDGBuilder& GraphBuilder,
+	FRDGTextureRef SourceTexture,
+	const FIntRect& ViewRect,
+	FRDGTextureRef DestinationTexture)
 {
-	// Create image from StylizedImage object
-	cv::Mat inputImage(Height, Width, CV_8UC3, InputImageCPU.GetData());
-
-	// Create image to resize for inferencing
-	cv::Mat outputImage(224, 224, CV_8UC3);
-
-	// Resize to outputImage
-	cv::resize(inputImage, outputImage, cv::Size(224, 224));
-
-	// Reshape to 1D
-	outputImage = outputImage.reshape(1, 1);
-
-	// uint_8, [0, 255] -> float, [0, 1]
-	std::vector<float> vec;
-	outputImage.convertTo(vec, CV_32FC1, 1. / 255);
-
-	// Height, Width, Channel to Channel, Height, Width
-	const int inputSize = 224 * 224 * 3;
-	ModelInputImage.Reset();
-	ModelInputImage.Reserve(inputSize);
-	for (size_t ch = 0; ch < 3; ++ch) {
-		for (size_t i = ch; i < inputSize; i += 3) {
-			ModelInputImage.Add(vec[i]);
+	if (!ModelProxy.IsValid() || SourceTexture == nullptr || !ViewRect.Area())
+	{
+		if (!ModelProxy.IsValid())
+		{
+			UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Skipping style transfer: model proxy invalid."));
 		}
+		else if (SourceTexture == nullptr)
+		{
+			UE_LOG(LogRealtimeStyleTransfer, Warning, TEXT("Skipping style transfer: source texture is null."));
+		}
+		else
+		{
+			UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Skipping style transfer: empty ViewRect (size %dx%d)."),
+				ViewRect.Width(),
+				ViewRect.Height());
+		}
+
+		return DestinationTexture ? DestinationTexture : SourceTexture;
 	}
+
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("ExecuteStyleTransfer start: source=%p, view=(%d,%d)-(%d,%d)."),
+		static_cast<const void*>(SourceTexture),
+		ViewRect.Min.X,
+		ViewRect.Min.Y,
+		ViewRect.Max.X,
+		ViewRect.Max.Y);
+
+	const FStyleTransferProxyPtr LocalProxy = ModelProxy;
+	IConsoleVariable* EnableCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RealtimeStyleTransfer.Enable"));
+	const bool bCVarEnabled = !EnableCVar || EnableCVar->GetInt() > 0;
+	if (!bCVarEnabled)
+	{
+		UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Skipping style transfer: console variable disabled."));
+		return DestinationTexture ? DestinationTexture : SourceTexture;
+	}
+
+	const FIntPoint ModelResolution = LocalProxy->InputResolution;
+	if (ModelResolution.X <= 0 || ModelResolution.Y <= 0)
+	{
+		UE_LOG(LogRealtimeStyleTransfer, Warning, TEXT("Model resolution invalid: %dx%d"), ModelResolution.X, ModelResolution.Y);
+		return SourceTexture;
+	}
+
+	const uint32 ChannelCount = static_cast<uint32>(FMath::Max(LocalProxy->InputChannels, 1));
+	const uint32 PlaneSize = ModelResolution.X * ModelResolution.Y;
+	const uint32 TensorElementCount = PlaneSize * ChannelCount;
+
+	FRDGBufferRef InputTensor = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(float), TensorElementCount),
+		TEXT("StyleTransfer.InputTensor"));
+
+	FRDGBufferRef OutputTensor = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(float), TensorElementCount),
+		TEXT("StyleTransfer.OutputTensor"));
+
+	// Encode screen texture into CHW tensor
+	{
+		UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Scheduling encode pass: ModelResolution=%dx%d, ViewSize=%dx%d."),
+			ModelResolution.X,
+			ModelResolution.Y,
+			ViewRect.Width(),
+			ViewRect.Height());
+		auto* Parameters = GraphBuilder.AllocParameters<FPStyleTransferShaders::FEncodeCS::FParameters>();
+		Parameters->ModelResolution = ModelResolution;
+		Parameters->ViewMin = FVector2f(ViewRect.Min.X, ViewRect.Min.Y);
+		Parameters->ViewSize = FVector2f(ViewRect.Width(), ViewRect.Height());
+		Parameters->SourceExtent = FVector2f(SourceTexture->Desc.Extent.X, SourceTexture->Desc.Extent.Y);
+		Parameters->EncodeScale = 1.0f;
+		Parameters->EncodeBias = 0.0f;
+		Parameters->ChannelCount = ChannelCount;
+		Parameters->SourceTexture = SourceTexture;
+		Parameters->SourceSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		Parameters->OutputTensor = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(InputTensor, PF_R32_FLOAT));
+
+		TShaderMapRef<FPStyleTransferShaders::FEncodeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("StyleTransfer.Encode"),
+			Shader,
+			Parameters,
+			MakeGroupCount(ModelResolution));
+	}
+
+	// Inference
+	{
+		TArray<UE::NNE::FTensorBindingRDG> InputBindings;
+		TArray<UE::NNE::FTensorBindingRDG> OutputBindings;
+		InputBindings.Emplace_GetRef().Buffer = InputTensor;
+		OutputBindings.Emplace_GetRef().Buffer = OutputTensor;
+
+		const UE::NNE::IModelInstanceRDG::EEnqueueRDGStatus Status =
+			LocalProxy->ModelInstance->EnqueueRDG(GraphBuilder, InputBindings, OutputBindings);
+
+	if (Status != UE::NNE::IModelInstanceRDG::EEnqueueRDGStatus::Ok)
+	{
+		UE_LOG(LogRealtimeStyleTransfer, Warning, TEXT("Failed to enqueue NNE inference, status=%d"), static_cast<int32>(Status));
+		return SourceTexture;
+	}
+
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("NNE inference enqueued successfully."));
+	}
+
+	// Decode tensor to low-res texture
+	FRDGTextureDesc StylizedDesc = FRDGTextureDesc::Create2D(
+		ModelResolution,
+		PF_FloatRGBA,
+		FClearValueBinding::Transparent,
+		TexCreate_ShaderResource | TexCreate_UAV);
+	FRDGTextureRef StylizedTexture = GraphBuilder.CreateTexture(StylizedDesc, TEXT("StyleTransfer.StylizedLowRes"));
+
+	{
+		UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Scheduling decode pass to texture %p."),
+			static_cast<const void*>(StylizedTexture));
+		auto* Parameters = GraphBuilder.AllocParameters<FPStyleTransferShaders::FDecodeCS::FParameters>();
+		Parameters->ModelResolution = ModelResolution;
+		Parameters->DecodeScale = 1.0f / 255.0f;
+		Parameters->DecodeBias = 0.0f;
+		Parameters->ChannelCount = ChannelCount;
+		Parameters->InputTensor = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OutputTensor, PF_R32_FLOAT));
+		Parameters->StylizedOutput = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(StylizedTexture));
+
+		TShaderMapRef<FPStyleTransferShaders::FDecodeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("StyleTransfer.Decode"),
+			Shader,
+			Parameters,
+			MakeGroupCount(ModelResolution));
+	}
+
+	// Upscale and composite back to the scene texture size
+	FRDGTextureDesc OutputDesc = SourceTexture->Desc;
+	OutputDesc.Flags |= TexCreate_ShaderResource | TexCreate_UAV;
+	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("StyleTransfer.Output"));
+
+	{
+		auto* Parameters = GraphBuilder.AllocParameters<FPStyleTransferShaders::FUpscaleCS::FParameters>();
+		Parameters->SourceResolution = ModelResolution;
+		Parameters->TargetResolution = ViewRect.Size();
+		Parameters->TargetOffset = ViewRect.Min;
+		Parameters->SourceTexture = StylizedTexture;
+		Parameters->SourceSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		Parameters->TargetTexture = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(OutputTexture));
+
+		UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Scheduling upscale pass: %dx%d -> %dx%d."),
+			ModelResolution.X,
+			ModelResolution.Y,
+			ViewRect.Width(),
+			ViewRect.Height());
+
+		TShaderMapRef<FPStyleTransferShaders::FUpscaleCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("StyleTransfer.UpScale"),
+			Shader,
+			Parameters,
+			MakeGroupCount(ViewRect.Size()));
+	}
+
+	if (DestinationTexture)
+	{
+		if (DestinationTexture != OutputTexture)
+		{
+			AddCopyTexturePass(GraphBuilder, OutputTexture, DestinationTexture);
+			UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Copying stylized texture back into destination."));
+		}
+		else
+		{
+			UE_LOG(LogRealtimeStyleTransfer, Warning, TEXT("Destination texture is identical to output texture; skipping copy."));
+		}
+		return DestinationTexture;
+	}
+
+	return OutputTexture;
 }
 
-
-//------------------------------------------------------------------------------
-void FRealtimeStyleTransferViewExtension::ResizeModelImageToMatchScreen()
+void FRealtimeStyleTransferViewExtension::SubscribeToPostProcessingPass(
+	EPostProcessingPass PassId,
+	const FSceneView& InView,
+	FAfterPassCallbackDelegateArray& InOutPassCallbacks,
+	bool bIsPassEnabled)
 {
-	if (ModelOutputImage.Num() == 0)
-	{
-		return;
-	}
+    if (!bIsPassEnabled)
+    {
+    	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("Post-processing pass %d disabled; skipping subscription."), PassId);
+    	return;
+    }
 
-	cv::Mat resultImage(224, 224, CV_8UC3, ModelOutputImage.GetData());
-	//cv::Mat resultoutputImage(Height, Width, CV_8UC3);
-	cv::resize(resultImage, resultImage, cv::Size(Width, Height));
+    IConsoleVariable* EnableCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RealtimeStyleTransfer.Enable"));
+    const bool bCVarEnabled = !EnableCVar || EnableCVar->GetInt() > 0;
+    const bool bModelAvailable = ModelProxy.IsValid();
 
-	//cv::imwrite("C:/code/ue5-onnxruntime/FPStyleTransfer/Content/resultImage.png", resultImage);
+    if (!bModelAvailable)
+    {
+    	UE_LOG(LogRealtimeStyleTransfer, Verbose, TEXT("Skipping subscription for pass %d (no model)."), PassId);
+    	return;
+    }
 
-	const uint8 *RawPixel = resultImage.data;
-	const int PixelCount = Width * Height;
-	StylizedImageCPU.Reset();
-	StylizedImageCPU.Reserve(PixelCount);
-	int y = 0;
-	for (int i = 0; i < PixelCount; i++)
-	{
-		uint32 R, G, B;
-		R = RawPixel[y++];
-		G = RawPixel[y++];
-		B = RawPixel[y++];
-		uint32 color = (R<<22)|(G<<12)|(B<<2)|3;
-		StylizedImageCPU.Add(color);
-	}
+    if (!bCVarEnabled)
+    {
+    	UE_LOG(LogRealtimeStyleTransfer, Verbose, TEXT("Skipping subscription for pass %d (console variable disabled)."), PassId);
+    	return;
+    }
+
+    if (PassId == EPostProcessingPass::Tonemap)
+    {
+    	UE_LOG(LogRealtimeStyleTransfer, Verbose, TEXT("Subscribing to Tonemap pass (View=%p)."), static_cast<const void*>(&InView));
+    	InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FRealtimeStyleTransferViewExtension::AfterTonemap_RenderThread));
+    }
 }
 
-//------------------------------------------------------------------------------
-void FRealtimeStyleTransferViewExtension::ApplyStyle() {
-	
-	// cv::imwrite("C:/code/ue5-onnxruntime/FPStyleTransfer/Content/inputImage.png", inputImage);
-	// create network and run model
-	ModelOutputImage.Reset();
-	myNetwork->URunModel(ModelInputImage, ModelOutputImage);
-}
-
-//------------------------------------------------------------------------------
-void FRealtimeStyleTransferViewExtension::SubscribeToPostProcessingPass(EPostProcessingPass PassId, FAfterPassCallbackDelegateArray &InOutPassCallbacks, bool bIsPassEnabled)
+FScreenPassTexture FRealtimeStyleTransferViewExtension::ApplyStyleTransfer(
+	FRDGBuilder& GraphBuilder,
+	const FSceneView& View,
+	const FPostProcessMaterialInputs& InOutInputs,
+	const FString& DDSFileName)
 {
-	if (!RealtimeStyleTransfer::IsActive)
+	if (!ModelProxy.IsValid())
 	{
-		return;
+		UE_LOG(LogRealtimeStyleTransfer, Verbose, TEXT("ApplyStyleTransfer skipped: no active model."));
+		return InOutInputs.OverrideOutput.IsValid()
+			? FScreenPassTexture(InOutInputs.OverrideOutput)
+			: FScreenPassTexture(InOutInputs.Textures[(uint32)EPostProcessMaterialInput::SceneColor]);
 	}
 
-	if (!bIsPassEnabled)
+	FScreenPassTexture SceneColor = InOutInputs.OverrideOutput.IsValid()
+		? FScreenPassTexture(InOutInputs.OverrideOutput)
+		: FScreenPassTexture(InOutInputs.Textures[(uint32)EPostProcessMaterialInput::SceneColor]);
+
+	if (!SceneColor.IsValid())
 	{
-		return;
+		UE_LOG(LogRealtimeStyleTransfer, Warning, TEXT("ApplyStyleTransfer skipped: SceneColor invalid."));
+		return SceneColor;
 	}
 
-	if (PassId == EPostProcessingPass::Tonemap) {
-		InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FRealtimeStyleTransferViewExtension::AfterTonemap_RenderThread));
-	}
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("ApplyStyleTransfer executing on %p, rect=(%d,%d)-(%d,%d)."),
+		static_cast<const void*>(SceneColor.Texture),
+		SceneColor.ViewRect.Min.X,
+		SceneColor.ViewRect.Min.Y,
+		SceneColor.ViewRect.Max.X,
+		SceneColor.ViewRect.Max.Y);
+
+	ExecuteStyleTransfer(GraphBuilder, SceneColor.Texture, SceneColor.ViewRect, SceneColor.Texture);
+	return SceneColor;
 }
 
-//------------------------------------------------------------------------------
-FScreenPassTexture FRealtimeStyleTransferViewExtension::ApplyStyleTransfer(FRDGBuilder &GraphBuilder, const FSceneView &View, const FPostProcessMaterialInputs &InOutInputs, const FString &DDSFileName)
-{
-	FRDGTextureRef SaveTexture = nullptr;
-	FScreenPassTexture ReturnTexture;
-
-	if (InOutInputs.OverrideOutput.IsValid())
-	{
-		SaveTexture = InOutInputs.OverrideOutput.Texture;
-		ReturnTexture = InOutInputs.OverrideOutput;
-	}
-	else
-	{
-		SaveTexture = InOutInputs.Textures[(uint32)EPostProcessMaterialInput::SceneColor].Texture;
-		ReturnTexture = const_cast<FScreenPassTexture &>(InOutInputs.Textures[(uint32)EPostProcessMaterialInput::SceneColor]);
-	}
-	
-	AddStylePass_RenderThread(GraphBuilder, SaveTexture);
-
-	return ReturnTexture;
-}
-
-//------------------------------------------------------------------------------
-FScreenPassTexture FRealtimeStyleTransferViewExtension::AfterTonemap_RenderThread(FRDGBuilder &GraphBuilder, const FSceneView &View, const FPostProcessMaterialInputs &InOutInputs)
+FScreenPassTexture FRealtimeStyleTransferViewExtension::AfterTonemap_RenderThread(
+	FRDGBuilder& GraphBuilder,
+	const FSceneView& View,
+	const FPostProcessMaterialInputs& InOutInputs)
 {
 	RDG_EVENT_SCOPE(GraphBuilder, "RealtimeStyleTransfer_AfterTonemap");
-	return ApplyStyleTransfer(GraphBuilder, View, InOutInputs, FString::Printf(TEXT("After%02dTonemap"), EPostProcessingPass::Tonemap));
+	UE_LOG(LogRealtimeStyleTransfer, VeryVerbose, TEXT("AfterTonemap_RenderThread invoked (ViewFamily=%p)"),
+		static_cast<const void*>(View.Family));
+	return ApplyStyleTransfer(GraphBuilder, View, InOutInputs, TEXT("StyleTransferTonemap"));
 }
 
 
-#undef LOCTEXT_NAMESPACE
