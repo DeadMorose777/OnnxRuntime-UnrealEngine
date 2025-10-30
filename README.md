@@ -1,93 +1,103 @@
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/159554721-a8db2b64-ee6e-416f-8008-aa08c077b177.png">
+# FPStyleTransfer (Unreal Engine 5.5)
 
-This code sample is to show you how to use the new Neural Network Inference (NNI) Plugin in Unreal Engine 5 which implements [ONNX Runtime](https://onnxruntime.ai/) to allow you to add Machine Learning (ML) Models in your projects. ONNX Runtime is a library to optimize and accelerate machine learning inferencing.
+Realtime neural style transfer sample updated to Unreal Engine 5.5 and the Neural Network Engine (NNE) Render Dependency Graph (RDG) runtime. The project keeps all tensors on the GPU – camera input is encoded with a compute shader, inference runs through `INNERuntimeRDG::EnqueueRDG`, and the stylised frame is decoded and composited as a post-tonemap pass.
 
-<img width="600" alt="image" src="https://user-images.githubusercontent.com/46505951/159556124-9e714170-c4c1-40e2-ac85-20e214912eb0.png">
+## Highlights
+- Works out of the box on UE 5.5 with Direct3D 12 (fallback to D3D11 for debugging only).
+- Uses the NNE `NNERuntimeRDG` or `NNERuntimeORTDml` backends – no CPU staging buffers.
+- Custom RDG pipeline (`StyleTransferShaders.usf`) to encode the scene into model input tensors and decode the inference output back to an HDR buffer.
+- Sample Blueprint (`Content/FirstPerson/Blueprints/StyleTransferConfig`) that exposes style switching and hotkeys.
+- Utility script to tidy exported ONNX models before import (`Scripts/clean_onnx_initializers.py`).
 
-We are using open source models from the ONNX model zoo to apply a style transform to the scene during game play. Check out the before and after pictures below to see how one of the models is able to stylize the scene.
+## Requirements
+- Windows 10/11 with a D3D12 capable GPU.
+- Unreal Engine **5.5** (tested with the launcher build).
+- Visual Studio 2022 with the **Game development with C++** workload if you intend to build from source.
+- Python 3.8+ with `onnx` installed (`pip install onnx`) to run the cleaning script.
 
-Before:
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/162550184-0ed88615-2dae-4b9f-a429-06ce668169f5.png">
+## Getting Started
 
-After:
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/162550233-018c0959-febd-4909-bc2e-0ffb8dd6368f.png">
+### 1. Clone
+```bash
+git clone https://github.com/DeadMorose777/OnnxRuntime-UnrealEngine.git
+cd OnnxRuntime-UnrealEngine/FPStyleTransfer
+```
 
-## Statement of Purpose
-This repository aims to grow the understanding of using ML models through the NNI Plugin in Unreal Engine 5 by providing an example of implementation and references to support the [Microsoft Build conference in 2022](https://mybuild.microsoft.com/). It is not intended to be a released product. Therefore, this repository is not for discussing ONNX Runtime, the NNI plugin or requesting new features.
+### 2. Enable plugins
+Inside the Unreal Editor open **Edit ▸ Plugins** and make sure the following are enabled:
+- **Neural Network Engine**
+- **Neural Rendering** (ships with UE; provides useful examples)
 
-# Prerequisites
-- [Unreal 5](https://www.unrealengine.com/unreal-engine-5)
-    - Check to make sure you have the [minimum hardware and software requirements](https://docs.unrealengine.com/5.0/en-US/hardware-and-software-specifications-for-unreal-engine/) to run UE. 
-    - Installing UE5 can take hours depending on your network and hardware. Please see the UE docs for information on [how to install UE5](https://docs.unrealengine.com/5.0/installing-unreal-engine/)
+Restart the editor when prompted.
 
-- [Visual Studio](https://visualstudio.microsoft.com/downloads/)
-    - Visual Studio 2019 v16.11.5 or later (recommended)
-    - Visual Studio 2022 
-        - Include [.Net Core 3.1](https://dotnet.microsoft.com/download/dotnet/3.1/runtime?cid=getdotnetcore)
+### 3. Build
+You can build either from Visual Studio or the command line:
 
-- Windows
-- The initial version of the NNI plugin supports CPU inference on PC (Windows/Linux/Mac) and Consoles (PS5/Xbox Series X). At the moment, GPU evaluation is only supported for Windows DirectX 12.
-- This project will only work up to version 5.2 of Unreal.  [Check out these docs for how to use the updated NNE plugin](https://dev.epicgames.com/community/learning/courses/e7w/unreal-engine-neural-network-engine-nne/nl83/unreal-engine-nne-overview)
+```powershell
+"C:\Program Files\Epic Games\UE_5.5\Engine\Build\BatchFiles\Build.bat" ^
+    FPStyleTransferEditor Win64 Development -Project="%CD%\FPStyleTransfer.uproject" -WaitMutex
+```
 
-# How to run this project
+Once the Editor target compiles, double-click `FPStyleTransfer.uproject` to open the sample map (`Content/FirstPerson/Maps/FirstPersonMap`).
 
-### Options 1: Run with Epic Games Launcher
-- Open the Epic Game Launcher and launch Unreal 5
-<img width="985" alt="image" src="https://user-images.githubusercontent.com/46505951/162548169-28a64ea5-3da0-4d06-a443-8083d56da4da.png">
+## Preparing Neural Style Models
 
-- Browse to the location that you cloned the project.
-- Select the `FPStyleTransfer.uproject` file and click open. This will load the same project.
- <img width="890" alt="image" src="https://user-images.githubusercontent.com/46505951/162548380-b6d5c3ad-0dc1-4982-b99d-2b0327b2c2a4.png">
- NOTE: If you receieve the below message click Fix Now and it will recompile the project.
- 
- <img width="500" alt="image" src="https://user-images.githubusercontent.com/46505951/164088506-35bb01f3-8ea8-4f05-a50d-7bfdc95a54d4.png">
+1. Export your model to ONNX. The sample network expects NCHW input shaped `1 x 3 x 224 x 224`.
+2. Remove initialiser tensors from the graph inputs – this keeps weights on the GPU and avoids const-folding issues:
+   ```bash
+   cd Scripts
+   py clean_onnx_initializers.py ..\FPStyleTransfer\Content\Models\your_model.onnx
+   ```
+   The script emits `your_model.cleaned.onnx` alongside the original.
+3. Import the cleaned ONNX file into Unreal:
+   - In the Content Browser choose **Add ▸ Import to…** and pick the `.cleaned.onnx`.
+   - When prompted, create an **NNE Model Data** asset (leave precision at FP32).
+   - Update the **Runtime** property of the asset if you know you will target a specific backend (e.g. `NNERuntimeORTDml` on Windows).
+4. (Optional) Move the asset into `Content/Models` to mirror the existing samples.
 
-- Once the project is loaded click play to see the project work!
+## Driving the Effect
 
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163624383-b848e76c-9c7f-4e1c-b102-5d1bf1f93e75.png">
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163624882-bcff90cf-b2d6-424f-90eb-f1127f82d4da.png">
+### Blueprint sample
+`Content/FirstPerson/Blueprints/StyleTransferConfig` demonstrates how to:
 
+1. Call `UStyleTransferBlueprintLibrary::SetStyle(ModelData, RuntimeName)` on Begin Play to choose the default style.
+2. Bind hotkeys to swap between different `UNNEModelData` assets.
+3. Disable the pass by calling `SetStyle` with a `None` reference (this also forces `r.RealtimeStyleTransfer.Enable = 0`).
 
+Feel free to duplicate the blueprint and customise the bindings or UI.
 
-### Option 2: Open and run in Visual Studio.
-- Browse to the location that you cloned the project.
-- Open the `FPStyleTransfer.sln` file.
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163624778-3ae5479a-b9d7-42eb-9514-9f6a6c883083.png">
+### Console and logging
+- Enable or disable the pass manually: `r.RealtimeStyleTransfer.Enable 1` / `0`.
+- Switch log detail while debugging:
+  ```text
+  Log LogRealtimeStyleTransfer VeryVerbose
+  Log LogStyleTransferNNE Verbose
+  ```
 
-- Hit F5 to run the project.
-- Click play to see the project work!
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163624383-b848e76c-9c7f-4e1c-b102-5d1bf1f93e75.png">
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163624882-bcff90cf-b2d6-424f-90eb-f1127f82d4da.png">
+### Runtime selection
+`SetStyle` accepts an optional runtime name. Pass `NNERuntimeRDGHlsl` to force the HLSL backend or `NNERuntimeORTDml` to use the DirectML implementation. When no name is provided, the runtime configured on the `UNNEModelData` asset is used.
 
+## Project Structure
 
-# How to select a different model
+| Path | Purpose |
+|------|---------|
+| `Source/FPStyleTransfer/RealtimeStyleTransferViewExtension.*` | Registers the RDG post-processing extension and drives encode/inference/decode. |
+| `Source/FPStyleTransfer/StyleTransferShaders.*` & `Shaders/StyleTransfer.usf` | Custom compute shaders that convert between render targets and tensors. |
+| `Source/FPStyleTransfer/MyNeuralNetwork.*` | Thin wrapper that creates an `IModelInstanceRDG` and stores tensor metadata on the game thread. |
+| `Source/FPStyleTransfer/StyleTransferBlueprintLibrary.*` | Exposes `SetStyle` to Blueprints and the console. |
+| `Scripts/clean_onnx_initializers.py` | Helper for sanitising exported ONNX graphs. |
+| `Content/Models/*.cleaned.onnx` | Cleaned models used by the sample. |
 
-There are 5 differnet models included from the ONNX Model Zoo. You can find them under the Content > Models folder in the UE Content Browser. To add your own models, drag and drop them into the Models folder in the Content Browser.
+## Troubleshooting
 
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163625334-0cbd8360-88b3-4b8d-91e3-67af120aabeb.png">
+- **No visual change** – ensure the runtime console variable is enabled (`r.RealtimeStyleTransfer.Enable 1`) and that a model is assigned via `SetStyle`. Check logs for the “Style transfer enabled…” message.
+- **Enqueue failures** – the log reports the RDG status code. Verify the runtime being requested is available (Plugins window) and that you are running with D3D12.
+- **Model import warnings** – run the cleaning script. NNE expects initialiser tensors to live in `graph.initializer`, not in the input list.
+- **Performance** – the sample runs at 224×224. Increase the tensor resolution in `RealtimeStyleTransferViewExtension.cpp` to trade speed for quality.
 
-To select one of the other preloaded models or one that you added yourself.
-- Select the `StyleTransferConfig` blueprint from the `Outliner`
-- In the `Details` under the `Default` section find the `Neural Network` property and select the dropdown. You will see a list of models available.
+## Links & Further Reading
+- [Neural Post Processing with Unreal Engine NNE](https://dev.epicgames.com/community/learning/tutorials/7dr8/unreal-engine-nne-neural-post-processing)
+- Epic’s `NeuralRendering` plugin (located in `Engine/Plugins/Experimental/NeuralRendering/`) contains additional examples that inspired this project.
 
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163626096-9500b5d1-3862-4c33-a545-87e09f4157db.png">
-
-- Select the model you would like to apply from the dropdown, and then click play to see the new style applied.
-
-<img width="1000" alt="image" src="https://user-images.githubusercontent.com/46505951/163626560-0ba69e90-0f98-40ea-9339-d017e3056b80.png">
-
-
-
-# Resources
-
-Grab open source models to add to your project:
-- [ONNX Model Zoo](https://github.com/onnx/models)
-- [Huggingface Models](https://huggingface.co/models)
-
-Connect with ONNX Runtime (ORT) on Social!
-
-- [Twitter](https://twitter.com/onnxruntime)
-- [YouTube](https://www.youtube.com/onnxruntime)
-- [Linkedin](https://www.linkedin.com/company/77691267/admin/)
-
-
+## License
+The original FPStyleTransfer sample is distributed by Microsoft. Refer to the repository licence file for details.
