@@ -65,7 +65,8 @@ Once the Editor target compiles, double-click `FPStyleTransfer.uproject` to open
 `Content/FirstPerson/Blueprints/StyleTransferConfig` demonstrates how to:
 
 1. Call `UStyleTransferBlueprintLibrary::SetStyle(ModelData, RuntimeName)` on Begin Play to choose the default style.
-2. Use the 'Model Data' variable to easily swap between different UNNEModelData assets.
+2. Use the 'Model Data' variable to easily swap between different UNNEModelData assets. <img width="417" height="855" alt="image" src="https://github.com/user-attachments/assets/efec4d8a-098f-4f64-a3df-557c6182aaa7" />
+
 3. Disable the pass by calling `SetStyle` with a `None` reference (this also forces `r.RealtimeStyleTransfer.Enable = 0`).
 
 Feel free to duplicate the blueprint and customise the bindings or UI.
